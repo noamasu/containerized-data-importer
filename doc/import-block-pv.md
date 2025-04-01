@@ -57,6 +57,9 @@ Create the following DataVolume manifest (import-block-pv-datavolume.yaml):
 apiVersion: cdi.kubevirt.io/v1beta1
 kind: DataVolume
 metadata:
+  annotations:
+    # Optional: Enable immediate binding (no waiting for pod consumption)
+    cdi.kubevirt.io/storage.bind.immediate.requested: "true"
   name: import-block-pv-datavolume
 spec:
   # Optional: Set the storage class or omit to accept the default
