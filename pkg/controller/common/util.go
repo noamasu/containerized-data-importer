@@ -1550,7 +1550,16 @@ func AddImmediateBindingAnnotationIfWFFCDisabled(obj metav1.Object, gates featur
 
 // InflateSizeWithOverhead inflates a storage size with proper overhead calculations
 func InflateSizeWithOverhead(ctx context.Context, c client.Client, imgSize int64, pvcSpec *corev1.PersistentVolumeClaimSpec) (resource.Quantity, error) {
-	var returnSize resource.Quantity
+	// Enforce the provisioner's minimum supported PVC size before applying overhead,
+	// so that filesystem overhead is calculated on top of the effective base size.
+	baseSize := *resource.NewScaledQuantity(imgSize, 0)
+	if pvcSpec.StorageClassName != nil {
+		effectiveSize, err := GetEffectiveVolumeSize(ctx, c, baseSize, *pvcSpec.StorageClassName, nil)
+		if err != nil {
+			return resource.Quantity{}, err
+		}
+		baseSize = effectiveSize
+	}
 
 	if util.ResolveVolumeMode(pvcSpec.VolumeMode) == corev1.PersistentVolumeFilesystem {
 		fsOverhead, err := GetFilesystemOverheadForStorageClass(ctx, c, pvcSpec.StorageClassName)
@@ -1559,16 +1568,11 @@ func InflateSizeWithOverhead(ctx context.Context, c client.Client, imgSize int64
 		}
 		// Parse filesystem overhead (percentage) into a 64-bit float
 		fsOverheadFloat, _ := strconv.ParseFloat(string(fsOverhead), 64)
-
-		// Merge the previous values into a 'resource.Quantity' struct
-		requiredSpace := util.GetRequiredSpace(fsOverheadFloat, imgSize)
-		returnSize = *resource.NewScaledQuantity(requiredSpace, 0)
-	} else {
-		// Inflation is not needed with 'Block' mode
-		returnSize = *resource.NewScaledQuantity(imgSize, 0)
+		requiredSpace := util.GetRequiredSpace(fsOverheadFloat, baseSize.Value())
+		baseSize = *resource.NewScaledQuantity(requiredSpace, 0)
 	}
 
-	return returnSize, nil
+	return baseSize, nil
 }
 
 // IsBound returns if the pvc is bound

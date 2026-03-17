@@ -9,10 +9,13 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 
 	cdiv1 "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
+	"kubevirt.io/containerized-data-importer/pkg/common"
 	sdkapi "kubevirt.io/controller-lifecycle-operator-sdk/api"
 )
 
@@ -404,6 +407,140 @@ var _ = Describe("sortEvents", func() {
 		Expect(events.Items[2].Message).To(Equal("[primeName] second prime"))
 		Expect(events.Items[3].Message).To(Equal("first"))
 		Expect(events.Items[4].Message).To(Equal("second"))
+	})
+})
+
+var _ = Describe("InflateSizeWithOverhead", func() {
+	const (
+		storageClassName = "test-sc"
+		fsOverhead       = "0.055"
+	)
+
+	newCDIConfig := func(globalOverhead cdiv1.Percent, scOverrides map[string]cdiv1.Percent) *cdiv1.CDIConfig {
+		return &cdiv1.CDIConfig{
+			ObjectMeta: metav1.ObjectMeta{Name: common.ConfigName},
+			Status: cdiv1.CDIConfigStatus{
+				FilesystemOverhead: &cdiv1.FilesystemOverhead{
+					Global:       globalOverhead,
+					StorageClass: scOverrides,
+				},
+			},
+		}
+	}
+
+	newStorageProfile := func(scName string, annotations map[string]string) *cdiv1.StorageProfile {
+		return &cdiv1.StorageProfile{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        scName,
+				Annotations: annotations,
+			},
+		}
+	}
+
+	fsPvcSpec := func(scName string) *v1.PersistentVolumeClaimSpec {
+		fsMode := v1.PersistentVolumeFilesystem
+		return &v1.PersistentVolumeClaimSpec{
+			StorageClassName: ptr.To(scName),
+			VolumeMode:       &fsMode,
+		}
+	}
+
+	blockPvcSpec := func(scName string) *v1.PersistentVolumeClaimSpec {
+		blockMode := v1.PersistentVolumeBlock
+		return &v1.PersistentVolumeClaimSpec{
+			StorageClassName: ptr.To(scName),
+			VolumeMode:       &blockMode,
+		}
+	}
+
+	It("should apply overhead on top of the minimum when requested size < minimum (filesystem)", func() {
+		oneGi := resource.MustParse("1Gi")
+		fourGi := resource.MustParse("4Gi")
+
+		cl := CreateClient(
+			CreateStorageClass(storageClassName, nil),
+			newCDIConfig("0", map[string]cdiv1.Percent{storageClassName: cdiv1.Percent(fsOverhead)}),
+			newStorageProfile(storageClassName, map[string]string{
+				AnnMinimumSupportedPVCSize: "4Gi",
+			}),
+		)
+
+		result, err := InflateSizeWithOverhead(context.Background(), cl, oneGi.Value(), fsPvcSpec(storageClassName))
+		Expect(err).ToNot(HaveOccurred())
+
+		// The minimum (4Gi) must be enforced first, then overhead applied on top.
+		// So the result must be strictly greater than 4Gi.
+		Expect(result.Cmp(fourGi)).To(Equal(1),
+			"expected result (%s) > minimum (4Gi): overhead must be applied after enforcing minimum", result.String())
+	})
+
+	It("should apply overhead on top of the requested size when it already exceeds the minimum (filesystem)", func() {
+		fiveGi := resource.MustParse("5Gi")
+
+		cl := CreateClient(
+			CreateStorageClass(storageClassName, nil),
+			newCDIConfig("0", map[string]cdiv1.Percent{storageClassName: cdiv1.Percent(fsOverhead)}),
+			newStorageProfile(storageClassName, map[string]string{
+				AnnMinimumSupportedPVCSize: "4Gi",
+			}),
+		)
+
+		result, err := InflateSizeWithOverhead(context.Background(), cl, fiveGi.Value(), fsPvcSpec(storageClassName))
+		Expect(err).ToNot(HaveOccurred())
+
+		Expect(result.Cmp(fiveGi)).To(Equal(1),
+			"expected result (%s) > requested (5Gi): overhead must be applied", result.String())
+	})
+
+	It("should enforce minimum without overhead for block mode", func() {
+		oneGi := resource.MustParse("1Gi")
+		fourGi := resource.MustParse("4Gi")
+
+		cl := CreateClient(
+			CreateStorageClass(storageClassName, nil),
+			newCDIConfig("0", nil),
+			newStorageProfile(storageClassName, map[string]string{
+				AnnMinimumSupportedPVCSize: "4Gi",
+			}),
+		)
+
+		result, err := InflateSizeWithOverhead(context.Background(), cl, oneGi.Value(), blockPvcSpec(storageClassName))
+		Expect(err).ToNot(HaveOccurred())
+
+		Expect(result.Cmp(fourGi)).To(Equal(0),
+			"expected result (%s) == minimum (4Gi) for block mode (no overhead)", result.String())
+	})
+
+	It("should return exact requested size for block mode when no minimum is set", func() {
+		twoGi := resource.MustParse("2Gi")
+
+		cl := CreateClient(
+			CreateStorageClass(storageClassName, nil),
+			newCDIConfig("0", nil),
+			newStorageProfile(storageClassName, nil),
+		)
+
+		result, err := InflateSizeWithOverhead(context.Background(), cl, twoGi.Value(), blockPvcSpec(storageClassName))
+		Expect(err).ToNot(HaveOccurred())
+
+		Expect(result.Cmp(twoGi)).To(Equal(0),
+			"expected result (%s) == requested (2Gi) for block mode without minimum", result.String())
+	})
+
+	It("should apply overhead even when no minimum is configured (filesystem)", func() {
+		oneGi := resource.MustParse("1Gi")
+
+		cl := CreateClient(
+			CreateStorageClass(storageClassName, nil),
+			newCDIConfig("0", map[string]cdiv1.Percent{storageClassName: cdiv1.Percent(fsOverhead)}),
+			newStorageProfile(storageClassName, nil),
+		)
+
+		result, err := InflateSizeWithOverhead(context.Background(), cl, oneGi.Value(), fsPvcSpec(storageClassName))
+		Expect(err).ToNot(HaveOccurred())
+
+		Expect(result.Cmp(oneGi)).To(Equal(1),
+			"expected result (%s) > requested (1Gi): overhead must be applied", result.String())
 	})
 })
 
