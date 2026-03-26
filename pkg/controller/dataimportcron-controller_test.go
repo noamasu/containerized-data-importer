@@ -1844,6 +1844,49 @@ var _ = Describe("All DataImportCron Tests", func() {
 				Expect(dv.Spec.Storage.AccessModes).To(BeEmpty())
 			})
 
+			It("Should delete old DV and requeue when first default StorageClass is set", func() {
+				sp := &cdiv1.StorageProfile{
+					ObjectMeta: metav1.ObjectMeta{Name: storageClassName},
+				}
+				reconciler = createDataImportCronReconciler(sc, sp)
+
+				dvName := "test-datasource-68b44fc891f3"
+				cron = newDataImportCron(cronName)
+				cc.AddAnnotation(cron, AnnSourceDesiredDigest, testDigest)
+				cron.Status = cdiv1.DataImportCronStatus{
+					CurrentImports: []cdiv1.ImportStatus{
+						{DataVolumeName: dvName, Digest: testDigest},
+					},
+				}
+				err := reconciler.client.Create(context.TODO(), cron)
+				Expect(err).ToNot(HaveOccurred())
+
+				dv := &cdiv1.DataVolume{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      dvName,
+						Namespace: metav1.NamespaceDefault,
+						Labels:    map[string]string{common.DataImportCronLabel: cronName},
+					},
+					Spec: cdiv1.DataVolumeSpec{
+						Source:  &cdiv1.DataVolumeSource{Registry: &cdiv1.DataVolumeSourceRegistry{URL: ptr.To(testRegistryURL)}},
+						Storage: &cdiv1.StorageSpec{},
+					},
+				}
+				err = reconciler.client.Create(context.TODO(), dv)
+				Expect(err).ToNot(HaveOccurred())
+
+				res, err := reconciler.Reconcile(context.TODO(), cronReq)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(res.RequeueAfter).To(Equal(time.Second))
+
+				err = reconciler.client.Get(context.TODO(), dvKey(dvName), dv)
+				Expect(k8serrors.IsNotFound(err)).To(BeTrue())
+
+				err = reconciler.client.Get(context.TODO(), cronKey, cron)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(cron.Annotations[AnnStorageClass]).To(Equal(storageClassName))
+			})
+
 		})
 	})
 })

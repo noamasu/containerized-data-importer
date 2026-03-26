@@ -364,7 +364,13 @@ func (r *DataImportCronReconciler) update(ctx context.Context, dataImportCron *c
 		}
 		currentSc, hasCurrent := dataImportCron.Annotations[AnnStorageClass]
 		desiredSc := desiredStorageClass.Name
-		if hasCurrent && currentSc != desiredSc {
+		var storageClassChanged bool
+		if hasCurrent {
+			storageClassChanged = currentSc != desiredSc
+		} else {
+			storageClassChanged = len(dataImportCron.Status.CurrentImports) > 0
+		}
+		if storageClassChanged {
 			r.log.Info("Storage class changed, delete most recent source on the old sc as it's no longer the desired", "currentSc", currentSc, "desiredSc", desiredSc)
 			if err := r.handleStorageClassChange(ctx, dataImportCron, desiredSc); err != nil {
 				return res, err
